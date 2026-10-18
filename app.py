@@ -244,8 +244,9 @@ with tab1:
                  ("4 · Split", "90/10", f"split, {b['cv_folds']}-fold CV"),
                  ("5 · Model", f"{int((~lb.Model.str.startswith('Baseline')).sum())}", f"models; best: {b['model_name']}"),
                  ("6 · Evaluate", f"{t['accuracy']:.1%}", f"test acc. (baseline {t['baseline_accuracy']:.0%})")]
-        for col, (step, value, note) in zip(st.columns(len(steps)), steps):
-            with col.container(border=True, height=190):
+        cols = st.columns(3)  # 2 rows of 3: stays readable on narrow screens
+        for i, (step, value, note) in enumerate(steps):
+            with cols[i % 3].container(border=True, height=150):
                 st.caption(step)
                 st.markdown(f"#### {value}")
                 st.caption(note)
