@@ -1,0 +1,9 @@
+# Tested with Python 3.13 (needs Python >= 3.11). Exact pins keep the saved model loadable.
+streamlit==1.66.0
+pandas==3.0.6
+numpy==2.5.4
+scikit-learn==1.9.1
+scipy==1.18.1
+plotly==7.1.0
+openpyxl==3.1.5
+openai==3.32.0

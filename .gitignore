@@ -1,0 +1,8 @@
+.venv/
+.claude/
+__pycache__/
+.DS_Store
+.streamlit/secrets.toml
+# only the synthetic demo data is public; client files stay local
+data/*
+!data/synthetic_demo.csv
