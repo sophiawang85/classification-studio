@@ -65,6 +65,20 @@ def cleaned(_b, key):
 
 
 @st.cache_data(show_spinner=False)
+def cell_fixes(_b, key):
+    """True where the cleaner changed a value: text in a number column, '1,234'-style numbers, placeholders, spelling variants."""
+    d, c = _b["data"], cleaned(_b, key)
+    fx = pd.DataFrame(False, index=d.index, columns=_b["features"])
+    for f in _b["schema"]["numeric"]:
+        fx[f] = d[f].notna() & pd.to_numeric(d[f], errors="coerce").isna()
+    for f in _b["schema"]["categorical"]:
+        raw = d[f].astype(object).where(d[f].notna())
+        canon = c[f].map(raw.groupby(c[f]).agg(lambda v: v.value_counts().index[0]))  # most common spelling per category
+        fx[f] = raw.notna() & (raw != canon)
+    return fx
+
+
+@st.cache_data(show_spinner=False)
 def mutual_info(_b, key):
     c, s = cleaned(_b, key), _b["schema"]
     X = pd.concat([c[s["numeric"]].fillna(c[s["numeric"]].median()),
@@ -186,7 +200,8 @@ with st.sidebar:
         st.success(f"Using **{llm['provider']}** · `{llm['model']}`", icon="🟢")
     else:
         st.info("No LLM configured - the **offline explainer** runs the same tools and fills a template. "
-                "For an open-source LLM with no key: install [Ollama](https://ollama.com) and `ollama pull qwen2.5:7b`.", icon="⚪")
+                "For an LLM-written explanation, pick OpenAI or Anthropic above and paste your own key, or run the app "
+                "locally with [Ollama](https://ollama.com) (`ollama pull qwen2.5:7b`) for a free open-source model.", icon="⚪")
 
 st.title("🧭 Classification Studio")
 st.caption("Labeled data in -> exploration -> cleaning -> validated model -> live predictions with an on-demand AI explainer.")
@@ -211,7 +226,63 @@ with tab1:
     c = cleaned(b, KEY)
     y = c[LABEL]
     mi = mutual_info(b, KEY)
-    eda, prep, split, model_tab = st.tabs(["Data exploration", "Cleaning & preprocessing", "Split strategy", "Training & evaluation"])
+    fx = cell_fixes(b, KEY)
+    overview, dataset, eda, prep, split, model_tab = st.tabs(
+        ["Overview", "Dataset", "Data exploration", "Cleaning & preprocessing", "Split strategy", "Training & evaluation"])
+
+    # ------------------------------------------------------------------ overview: the whole analysis at a glance
+    with overview:
+        lb, t, log = b["leaderboard"], b["test"], b["log"]
+        dups = int(log.loc[log.Step.str.startswith("Removed exact duplicate"), "Affected"].sum())
+        st.markdown(f"**The question:** from a case's inputs **{', '.join(b['all_features'])}**, predict its class **{LABEL}** "
+                    f"({' / '.join(CLASSES)}). Past cases with known outcomes make this **supervised classification**; success "
+                    f"means beating the always-guess-the-majority baseline ({t['baseline_accuracy']:.1%}) on data the model has never seen.")
+        st.markdown("#### How the analysis was done")
+        steps = [("1 · Load", f"{int(log.Affected.iloc[0]):,}", "labeled rows"),
+                 ("2 · Explore", f"{len(FEATS)}", f"features ({len(NUM)} num, {len(CAT)} cat)"),
+                 ("3 · Clean", f"{int(fx.values.sum()):,}", f"cells fixed, {dups:,} duplicates dropped"),
+                 ("4 · Split", "90/10", f"split, {b['cv_folds']}-fold CV"),
+                 ("5 · Model", f"{int((~lb.Model.str.startswith('Baseline')).sum())}", f"models; best: {b['model_name']}"),
+                 ("6 · Evaluate", f"{t['accuracy']:.1%}", f"test acc. (baseline {t['baseline_accuracy']:.0%})")]
+        for col, (step, value, note) in zip(st.columns(len(steps)), steps):
+            with col.container(border=True, height=190):
+                st.caption(step)
+                st.markdown(f"#### {value}")
+                st.caption(note)
+        st.caption("Each step has its own tab above, in order. Tab 2 then runs the saved pipeline on new files and explains single predictions.")
+        st.markdown("#### From business need to ML design")
+        st.markdown(f"""
+| Business need | ML decision | Where to see it |
+|---|---|---|
+| Predict an outcome from past cases | Supervised classification of `{LABEL}` from {len(FEATS)} inputs | Dataset, Data exploration |
+| Real-world inputs are messy | One scikit-learn pipeline parses, cleans, imputes, de-skews and encodes, fitted on training rows only | Cleaning & preprocessing |
+| It must work on new data | A locked 10% test set; every choice made with {b['cv_folds']}-fold CV on the other 90% | Split strategy |
+| "Is it good enough?" | Accuracy vs the majority baseline, with balanced accuracy and macro-F1 alongside | Training & evaluation |
+| People must trust each prediction | Probabilities plus on-demand Shapley explanations and counterfactuals | Tab 2 |""")
+
+    # ------------------------------------------------------------------ dataset: browse the training data
+    with dataset:
+        d = b["data"]
+        st.markdown(f"The labeled data behind the current model: **{len(d):,} rows** from `{b['source']}` (after dropping exact "
+                    "duplicates and unlabeled rows). Switch between the values **as uploaded** and **as the model reads them**; "
+                    "highlighted cells are values the cleaner had to fix.")
+        v1, v2, v3 = st.columns([2, 3, 2])
+        view = v1.radio("Values", ["As uploaded", "After cleaning"], horizontal=True, key="ds_view")
+        part = v2.radio("Rows", ["All", "Training set (90%)", "Test set (10%)"], horizontal=True, key="ds_part")
+        only = v3.toggle("Only rows with fixes", key="ds_only")
+        idx = d.index if part == "All" else d.index[d.split == ("train" if part.startswith("Training") else "test")]
+        if only:
+            idx = idx[fx.loc[idx].any(axis=1).to_numpy()]
+        cols = (b["all_features"] if view == "As uploaded" else FEATS) + [LABEL, "split"]
+        shown = (d if view == "As uploaded" else c).loc[idx, cols]
+        hi = fx.loc[idx]
+        tidy = (lambda v: "" if v is None or (not isinstance(v, str) and pd.isna(v))
+                else f"{v:g}" if isinstance(v, (float, np.floating)) else str(v))
+        st.dataframe(shown.style.format(tidy).apply(lambda col: np.where(hi[col.name], "background-color: rgba(235,104,52,0.25)", "")
+                                                    if col.name in hi else [""] * len(col)), height=35 * 20 + 3)
+        st.caption(f"{len(idx):,} rows · {int(hi.values.sum()):,} fixed cells highlighted · grey None = missing value (imputed inside the pipeline)")
+        st.download_button("⬇ Download this view (CSV)", shown.to_csv(index_label="row"),
+                           f"dataset_{'raw' if view == 'As uploaded' else 'cleaned'}_{part.split()[0].lower()}.csv", "text/csv", on_click="ignore")
 
     # ------------------------------------------------------------------ exploration
     with eda:

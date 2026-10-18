@@ -1,10 +1,14 @@
 # Classification Studio
 
+**Live demo: [classification-studio-sihanwang.streamlit.app](https://classification-studio-sihanwang.streamlit.app/)**
+(running on a synthetic demo dataset)
+
 An end-to-end classifier for tabular data with **inputs A–G and label H**. You upload labeled data. The app explores it,
 cleans it, picks a validated model, and scores new files live. An on-demand **AI agent** explains each individual
 prediction.
 
-* **Tab 1 – Explore, preprocess & model:** EDA, the cleaning log, before/after views of every transformation, the
+* **Tab 1 – Explore, preprocess & model:** an overview of the whole analysis, a browsable view of the training data
+  (as uploaded vs. after cleaning, with every fixed cell highlighted), EDA, the cleaning log, before/after views of every transformation, the
   split strategy, a comparison of 6 tuned model families plus an ensemble, and test-set results.
 * **Tab 2 – Predict & explain:** upload the hold-out set (or any A–G file). The saved pipeline cleans, encodes and
   scores it right away. Tick **💬 Explain** on any row to ask the agent why the model predicted it.
