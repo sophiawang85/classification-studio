@@ -1,14 +1,18 @@
 """On-demand prediction explainer (agentic).
 
-The agent explains ONE row. Its tools are plain Python over the trained pipeline
-(exact Shapley values, training-data context, what-if re-scoring), so every
-number it quotes is computed, never generated. An LLM - any OpenAI-compatible
-endpoint: local Ollama (open-source, no key), OpenAI, Anthropic - decides which
-tools to call and writes the narrative. With no LLM available the same tools
-feed a deterministic template, so "Explain" always works.
+The agent explains ONE row and answers follow-up questions about it. Its tools are plain Python over the trained
+pipeline (exact Shapley values, training-data context, what-if re-scoring, counterfactual search), so every number it
+quotes is computed, never generated. A local open-source LLM served by Ollama decides which tools to call and writes
+the answer. If Ollama isn't reachable, the same tools feed a deterministic template, so "Explain" always works.
+
+Backend settings (environment variables, never shown in the UI):
+  OLLAMA_HOST     default http://localhost:11434
+  OLLAMA_MODEL    default qwen2.5:7b if installed, else the best installed chat model
+  OLLAMA_API_KEY  optional bearer token for a remote/hosted Ollama server
 """
 import json
 import os
+import re
 import urllib.request
 from math import factorial
 
@@ -17,24 +21,27 @@ import pandas as pd
 
 from pipeline import Cleaner
 
-PROVIDERS = {
-    "Ollama (local, open-source)": {"base_url": "http://localhost:11434/v1", "model": "qwen2.5:7b", "env": None},
-    "OpenAI": {"base_url": "https://api.openai.com/v1", "model": "gpt-4.1-mini", "env": "OPENAI_API_KEY"},
-    "Anthropic (Claude)": {"base_url": "https://api.anthropic.com/v1/", "model": "claude-haiku-5-5", "env": "ANTHROPIC_API_KEY"},
-    "Custom (OpenAI-compatible)": {"base_url": "", "model": "", "env": "LLM_API_KEY"},
-}
-OLLAMA_PREFS = ("qwen3", "qwen2.5", "llama3.1", "llama3.2", "mistral")
+DEFAULT_MODEL = "qwen2.5:7b"
+MODEL_PREFS = ("qwen2.5", "qwen3", "llama3.1", "llama3.2", "mistral", "gpt-oss")
 
-SYSTEM = """You explain one prediction of a tabular classifier to a business user.
-Investigate with the tools before answering: call get_feature_contributions first; use get_feature_context to judge
-whether the driving values are high, low or unusual; use find_counterfactual (or what_if) to say what would change
-the outcome. Only quote numbers returned by tools. Feature names are opaque codes - do not guess what they mean.
-Reply in Markdown, under 170 words, with exactly these parts:
+SYSTEM = """You explain one prediction of a tabular classifier to a business user. Tools have already gathered the
+evidence; it is given to you as verified sentences. Write the explanation ONLY from those sentences: keep every number
+and direction exactly as written, never compute or compare values yourself, and never mention a feature, value or
+change that is not in the evidence. Feature names are opaque codes - do not guess what they mean.
+Reply in Markdown, under 130 words, with exactly these three parts (caveats are added separately - do not write any):
 **Verdict** - one sentence: predicted class and confidence.
-**Why** - 2-4 bullets, strongest first: `feature = value`, direction and size in probability points, and why
-(compare with typical training values).
-**What would change it** - one bullet.
-**Caveats** - only if relevant (missing / unseen / out-of-range inputs, low confidence)."""
+**Why** - 2-4 bullets for the largest contributions, strongest first: the contribution sentence plus the matching
+comparison with the training data.
+**What would change it** - the first "Changing ..." sentence from the evidence, or say the prediction is robust."""
+
+CHAT_SYSTEM = """You are the explanation agent of a tabular classifier, answering a business user's follow-up questions
+about ONE prediction. Verified evidence about it is in the conversation. When a question needs numbers that are not
+there yet, call a tool: what_if to re-score changed values, find_counterfactual for what would flip it,
+get_feature_context to compare a value with the training data, get_model_card for questions about the model itself.
+Tool results come back as verified sentences. Answer ONLY from verified sentences: keep their numbers and directions
+exactly, never compute or compare values yourself, never invent features, values or changes. Feature names are opaque
+codes - do not guess what they mean. If the question assumes something the evidence contradicts, say so and correct
+it. Pass what_if only the changes the user asked about. Answer in at most 4 short sentences or bullets, in Markdown."""
 
 TOOL_SPECS = [{"type": "function", "function": f} for f in [
     {"name": "get_feature_contributions",
@@ -103,8 +110,12 @@ def make_tools(bundle: dict, x: pd.DataFrame):
         return float(100 * np.searchsorted(s, v) / max(len(s), 1))
 
     def get_feature_contributions():
-        rows = [{"feature": f, "value": _fmt(clean[f]), "effect_pts": round(100 * phi[j, k], 1)} for j, f in enumerate(feats)]
+        rows = [{"feature": f, "value": _fmt(clean[f]), "effect_pts": round(100 * phi[j, k], 1),
+                 "summary": f"{f} = {_fmt(clean[f])} {'raises' if phi[j, k] > 0 else 'lowers'} P({pred}) by {abs(100 * phi[j, k]):.1f} points"}
+                for j, f in enumerate(feats)]
         return {"explaining_class": pred, "baseline_pct": round(100 * base[k], 1), "final_pct": round(100 * proba[k], 1),
+                "summary": f"The model predicts {pred} with {proba[k]:.0%} confidence. An average row gets P({pred}) = "
+                           f"{100 * base[k]:.1f}%; this row's features move it to {100 * proba[k]:.1f}%.",
                 "contributions": sorted(rows, key=lambda r: -abs(r["effect_pts"])),
                 "method": "exact Shapley values vs. a training background; effects add up from baseline to final probability"}
 
@@ -113,15 +124,31 @@ def make_tools(bundle: dict, x: pd.DataFrame):
         for f in [by_name[feature.casefold()]] if feature and feature.casefold() in by_name else feats:
             s, v = stats[f], clean[f]
             if s["type"] == "numeric":
-                out[f] = ({"value": "missing", "note": f"imputed with the training median {s['median']:.4g}"} if pd.isna(v) else
-                          {"value": round(float(v), 4), "percentile_in_training": round(pct(f, v)),
-                           "training_median": round(float(s["median"]), 4), "median_by_class": s["median_by_class"],
-                           "outside_training_range": bool(v < s["min"] or v > s["max"])})
+                if pd.isna(v):
+                    out[f] = {"value": "missing", "note": f"imputed with the training median {s['median']:.4g}",
+                              "summary": f"{f} is missing in this row; the model used the training median {_fmt(s['median'])}. Caveat: missing value."}
+                    continue
+                side = "above" if v > s["median"] else "below" if v < s["median"] else "equal to"
+                q = pct(f, v)
+                level = ("unusually low" if q < 10 else "low" if q < 30 else "typical" if q <= 70 else "high" if q <= 90 else "unusually high")
+                by_cls = "; ".join(f"class {c} median {_fmt(m)} ({'above' if v > m else 'below' if v < m else 'equal'})"
+                                   for c, m in s["median_by_class"].items())
+                outside = bool(v < s["min"] or v > s["max"])
+                out[f] = {"value": round(float(v), 4), "percentile_in_training": round(pct(f, v)),
+                          "training_median": round(float(s["median"]), 4), "median_by_class": s["median_by_class"],
+                          "outside_training_range": outside,
+                          "summary": f"{f} = {_fmt(v)} is {level} ({_nth(q)} percentile of training data), {side} the overall "
+                                     f"median {_fmt(s['median'])}. Compared with each class: {by_cls}. "
+                                     + ("Caveat: OUTSIDE the training range." if outside else "Within the training range.")}
             else:
                 key = "missing" if pd.isna(v) else v
+                mix = s["class_mix"].get(key)
                 out[f] = {"value": key, "share_of_training_rows": s["share"].get(key, 0.0),
-                          "class_mix_for_this_value": s["class_mix"].get(key, "unseen in training"),
-                          "overall_class_mix": {str(c): round(p, 3) for c, p in bundle["class_mix"].items()}}
+                          "class_mix_for_this_value": mix if mix is not None else "unseen in training",
+                          "overall_class_mix": {str(c): round(p, 3) for c, p in bundle["class_mix"].items()},
+                          "summary": (f"{f} = {key}: never seen in training. Caveat: unseen category." if mix is None else
+                                      f"{f} = {key}: {s['share'].get(key, 0):.0%} of training rows; {mix.get(pred, 0):.0%} of them are "
+                                      f"class {pred} (vs {bundle['class_mix'].get(pred, 0):.0%} overall).")}
         return out
 
     def score(rows):
@@ -146,25 +173,33 @@ def make_tools(bundle: dict, x: pd.DataFrame):
             i = min(idx, key=lambda i: abs(pct(f, tries[i][1]) - cur) if stats[f]["type"] == "numeric" else -P[i].max())
             flips.append({"feature": f, "from": _fmt(clean[f]), "to": _fmt(tries[i][1]), "new_prediction": classes[P[i].argmax()],
                           "new_confidence": round(float(P[i].max()), 3),
+                          "summary": f"Changing {f} from {_fmt(clean[f])} to {_fmt(tries[i][1])} would flip the prediction to "
+                                     f"{classes[P[i].argmax()]} ({P[i].max():.0%}).",
                           "size_of_change": f"{abs(pct(f, tries[i][1]) - cur):.0f} percentile points" if stats[f]["type"] == "numeric" else "category swap"})
         if flips:
             return {"flips": flips[:4]}
         i = int(P[:, k].argmin())
         return {"flips": [], "note": "no single-feature change flips the prediction",
+                "summary": f"No single-feature change flips the prediction from {pred}; the prediction is robust.",
                 "largest_drop": {"feature": tries[i][0], "to": _fmt(tries[i][1]), f"P({pred})": round(float(P[i, k]), 3)}}
 
     def what_if(changes: dict):
         known = {by_name[str(f).casefold()]: v for f, v in (changes or {}).items() if str(f).casefold() in by_name}
         p2 = score([{**raw, **known}])[0]
+        new = classes[int(p2.argmax())]
         return {"applied_changes": known, "ignored": [f for f in (changes or {}) if str(f).casefold() not in by_name],
-                "new_prediction": classes[int(p2.argmax())], "new_probabilities": {c: round(float(q), 3) for c, q in zip(classes, p2)}}
+                "new_prediction": new, "new_probabilities": {c: round(float(q), 3) for c, q in zip(classes, p2)},
+                "summary": f"With {', '.join(f'{f} = {v}' for f, v in known.items()) or 'no valid changes'}, the model predicts "
+                           f"{new} ({p2.max():.0%}); as uploaded it predicted {pred} ({proba[k]:.0%})."}
 
     def get_model_card():
         lb = bundle["leaderboard"].set_index("Model")
         return {"model": bundle["model_name"], "classes": classes,
                 "cv_accuracy": round(float(lb.loc[bundle["model_name"], "CV accuracy"]), 4),
                 "test_accuracy": round(float(bundle["test"]["accuracy"]), 4),
-                "top_features_globally": bundle["importance"]["Feature"].head(5).tolist()}
+                "top_features_globally": bundle["importance"]["Feature"].head(5).tolist(),
+                "summary": f"The model is {bundle['model_name']}; it is {bundle['test']['accuracy']:.1%} accurate on the held-out "
+                           f"test set. Most important features overall: {', '.join(bundle['importance']['Feature'].head(3))}."}
 
     tools = {f.__name__: f for f in (get_feature_contributions, get_feature_context, find_counterfactual, what_if, get_model_card)}
     facts = {"row": {f: _fmt(clean[f]) for f in feats}, "predicted_class": pred, "confidence": round(float(proba[k]), 3),
@@ -172,43 +207,70 @@ def make_tools(bundle: dict, x: pd.DataFrame):
     return tools, facts
 
 
-def _json(o):
-    return o.item() if hasattr(o, "item") else str(o)
+def _summaries(o) -> list:
+    """All 'summary' sentences in a tool result, in order."""
+    if isinstance(o, dict):
+        return ([o["summary"]] if "summary" in o else []) + [t for k, v in o.items() if k != "summary" for t in _summaries(v)]
+    return [t for v in o for t in _summaries(v)] if isinstance(o, list) else []
 
 
-def run_agent(tools, facts, llm, client=None, max_steps=6):
-    """Tool-calling loop: the LLM picks tools until it is ready to answer."""
-    if client is None:
-        from openai import OpenAI
-        client = OpenAI(base_url=llm["base_url"], api_key=llm.get("api_key") or "none", timeout=120, max_retries=1)
-    msgs = [{"role": "system", "content": SYSTEM},
-            {"role": "user", "content": "Explain this prediction:\n" + json.dumps(facts, default=_json)}]
+def _dumps(o):
+    return json.dumps(o, default=lambda v: v.item() if hasattr(v, "item") else str(v), separators=(",", ":"))
+
+
+def _ollama(path, payload=None, timeout=180):
+    host = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+    host = host if "://" in host else "http://" + host  # OLLAMA_HOST is often written as "127.0.0.1:11434"
+    headers = {"Content-Type": "application/json"}
+    if os.environ.get("OLLAMA_API_KEY"):
+        headers["Authorization"] = "Bearer " + os.environ["OLLAMA_API_KEY"]
+    req = urllib.request.Request(host + path, json.dumps(payload).encode() if payload is not None else None, headers)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)
+
+
+def ollama_status():
+    """(model, note): the model the agent will use, or None and why not."""
+    try:
+        names = [m["name"] for m in _ollama("/api/tags", timeout=3).get("models", []) if "embed" not in m["name"]]
+    except Exception:
+        return None, "Ollama is not running"
+    if os.environ.get("OLLAMA_MODEL"):
+        return os.environ["OLLAMA_MODEL"], ""
+    pick = next((n for pref in (DEFAULT_MODEL, *MODEL_PREFS) for n in names if n.startswith(pref)), names[0] if names else None)
+    return (pick, "") if pick else (None, f"Ollama has no model yet - run `ollama pull {DEFAULT_MODEL}`")
+
+
+def ollama_chat(model, messages):
+    """One /api/chat round with the agent's tools available; returns the assistant message."""
+    msg = _ollama("/api/chat", {"model": model, "messages": messages, "tools": TOOL_SPECS, "stream": False,
+                                "options": {"temperature": 0.2, "num_ctx": 8192}})["message"]
+    msg["content"] = re.sub(r"<think>.*?</think>", "", msg.get("content") or "", flags=re.S).strip()
+    return msg
+
+
+def run_agent(tools, messages, chat, max_steps=5):
+    """Tool-calling loop. `chat(messages)` returns an assistant message in Ollama's /api/chat shape."""
     trace = []
     for step in range(max_steps):
         if step == max_steps - 1:
-            msgs.append({"role": "user", "content": "Write the final answer now, without further tool calls."})
-        msg = client.chat.completions.create(model=llm["model"], messages=msgs, tools=TOOL_SPECS).choices[0].message
-        if not msg.tool_calls:
-            if not trace and step == 0:  # answered without evidence: push it back to the tools once
-                msgs += [{"role": "assistant", "content": msg.content or ""},
-                         {"role": "user", "content": "Call get_feature_contributions first and base the answer on it."}]
-                continue
-            return (msg.content or "").strip(), trace
+            messages.append({"role": "user", "content": "Write the final answer now, without further tool calls."})
+        msg = chat(messages)
+        calls = msg.get("tool_calls") or []
+        if not calls:
+            return msg.get("content", ""), trace
         if step == max_steps - 1:
             break
-        msgs.append({"role": "assistant", "content": msg.content or "",
-                     "tool_calls": [{"id": t.id, "type": "function",
-                                     "function": {"name": t.function.name, "arguments": t.function.arguments or "{}"}}
-                                    for t in msg.tool_calls]})
-        for t in msg.tool_calls:
-            args = {}
+        messages.append({"role": "assistant", "content": msg.get("content", ""), "tool_calls": calls})
+        for c in calls:
+            name, args = c["function"]["name"], c["function"].get("arguments") or {}
             try:
-                args = json.loads(t.function.arguments or "{}") or {}
-                result = tools[t.function.name](**args)
+                args = json.loads(args) if isinstance(args, str) else args
+                result = tools[name](**args)
             except Exception as e:  # bad tool name/arguments go back to the model, not to the user
                 result = {"error": f"{type(e).__name__}: {e}"}
-            trace.append({"tool": t.function.name, "args": args, "result": result})
-            msgs.append({"role": "tool", "tool_call_id": t.id, "content": json.dumps(result, default=_json)})
+            trace.append({"tool": name, "args": args, "result": result})
+            messages.append({"role": "tool", "tool_name": name, "content": "\n".join(_summaries(result)) or _dumps(result)})
     return "", trace
 
 
@@ -247,42 +309,102 @@ def offline_text(facts, contrib, ctx, cf) -> str:
     return "\n".join(lines)
 
 
-def explain(bundle: dict, x: pd.DataFrame, llm: dict | None = None) -> dict:
+CLAIM = re.compile(r"`?(\w+)\s*=\s*([^\s`]+)`?\s+(raises|lowers|increases|decreases|reduces)\s+P\((\w+)\)\s+by\s+"
+                   r"([\d.]+)\s*(?:probability\s+)?points?", re.I)
+
+
+def fix_claims(text: str, contrib: dict) -> str:
+    """Guardrail: an 'X = v raises/lowers P(c) by n points' claim that contradicts the Shapley values is rewritten."""
+    truth = {r["feature"].casefold(): r for r in contrib["contributions"]}
+
+    def check(m):
+        r = truth.get(m.group(1).casefold())
+        if r is None or m.group(4) != contrib["explaining_class"]:
+            return m.group(0)
+        same_way = (m.group(3).lower() in ("raises", "increases")) == (r["effect_pts"] > 0)
+        return m.group(0) if same_way and abs(float(m.group(5)) - abs(r["effect_pts"])) < 0.15 else r["summary"]
+    return CLAIM.sub(check, text)
+
+
+def _evidence(tools):
+    """The agent's fixed first step for any row: drivers, training-data context, what would flip it."""
+    return [(n, tools[n]()) for n in ("get_feature_contributions", "get_feature_context", "find_counterfactual")]
+
+
+def _briefing(facts, evidence) -> str:
+    return (f"Prediction: {facts['predicted_class']} with {facts['confidence']:.0%} confidence.\nVerified evidence:\n"
+            + "\n".join(f"- {t}" for _, r in evidence for t in _summaries(r)))
+
+
+def explain(bundle: dict, x: pd.DataFrame, model: str | None = None, chat=None) -> dict:
     tools, facts = make_tools(bundle, x)
-    contrib = tools["get_feature_contributions"]()
-    text, trace, engine = "", [], "Offline explainer (no LLM configured) - same tools, templated wording"
-    if llm:
+    evidence = _evidence(tools)
+    (_, contrib), (_, ctx), (_, cf) = evidence
+    trace = [{"tool": n, "args": {}, "result": r} for n, r in evidence]
+    text, engine = "", "Offline explainer (Ollama not available) - same tools, templated wording"
+    if model:
         try:
-            text, trace = run_agent(tools, facts, llm)
-            engine = f"{llm['provider']} - {llm['model']} (tool-calling agent)"
+            text, more = run_agent(tools, [{"role": "system", "content": SYSTEM},
+                                           {"role": "user", "content": _briefing(facts, evidence) + "\n\nWrite the explanation."}],
+                                   chat or (lambda m: ollama_chat(model, m)))
+            trace += more
+            text = fix_claims(text, contrib)
+            # caveats are facts, so they come from the data, never from the model
+            text = re.sub(r"\n*\**Caveats?\**.*\Z", "", text, flags=re.S | re.I).rstrip()
+            caveats = [f"`{f}`: {c['summary'].split('Caveat: ')[1].rstrip('.')}" for f, c in ctx.items() if "Caveat: " in c["summary"]]
+            caveats += [f"low confidence ({facts['confidence']:.1%}) - close to the decision boundary"] if facts["confidence"] < 0.6 else []
+            text += ("\n\n**Caveats** - " + "; ".join(caveats) + ".") if caveats and text else ""
+            engine = f"Ollama · {model} (agent)" if text else "Offline explainer - the model gave no final answer"
         except Exception as e:
-            engine = f"Offline explainer - LLM call failed ({type(e).__name__}: {str(e)[:200]})"
+            engine = f"Offline explainer - Ollama call failed ({type(e).__name__}: {str(e)[:160]})"
     if not text:
-        ctx, cf = tools["get_feature_context"](), tools["find_counterfactual"]()
-        trace = [{"tool": n, "args": {}, "result": r} for n, r in
-                 [("get_feature_contributions", contrib), ("get_feature_context", ctx), ("find_counterfactual", cf)]]
         text = offline_text(facts, contrib, ctx, cf)
     return {"text": text, "engine": engine, "trace": trace, "contrib": contrib, "facts": facts}
 
 
-# ----------------------------------------------------------------------------- LLM discovery
-def ollama_models(url="http://localhost:11434") -> list:
-    try:
-        with urllib.request.urlopen(f"{url}/api/tags", timeout=1) as r:
-            return [m["name"] for m in json.load(r).get("models", []) if "embed" not in m["name"]]
-    except Exception:
-        return []
+def ask(bundle: dict, x: pd.DataFrame, explanation: str, history: list, question: str, model: str | None = None, chat=None) -> dict:
+    """Answer a follow-up question about one row. `history` = earlier turns as [{"role", "content"}]."""
+    tools, facts = make_tools(bundle, x)
+    note = ""
+    asked = asked_changes(question, facts["row"])
+    if asked:  # guardrail: a what-if re-scores exactly the values the user named, whatever the model passes
+        what_if = tools["what_if"]
+        tools = {**tools, "what_if": lambda changes=None: what_if(asked)}
+    if model:
+        msgs = [{"role": "system", "content": CHAT_SYSTEM},
+                {"role": "user", "content": _briefing(facts, _evidence(tools))},
+                {"role": "assistant", "content": explanation}, *history, {"role": "user", "content": question}]
+        try:
+            text, trace = run_agent(tools, msgs, chat or (lambda m: ollama_chat(model, m)))
+            if text:
+                return {"text": fix_claims(text, tools["get_feature_contributions"]()), "tools": [t["tool"] for t in trace]}
+            note = "the model gave no answer"
+        except Exception as e:
+            note = f"Ollama call failed ({type(e).__name__})"
+    return offline_answer(question, tools, facts) | ({"note": note} if note else {})
 
 
-def auto_llm() -> dict | None:
-    """Env key (OpenAI, then Anthropic) -> running Ollama -> None (offline explainer)."""
-    for name in ("OpenAI", "Anthropic (Claude)"):
-        p = PROVIDERS[name]
-        if os.environ.get(p["env"]):
-            return {"provider": name, "base_url": p["base_url"], "model": p["model"], "api_key": os.environ[p["env"]]}
-    models = ollama_models()
-    if models:
-        pick = next((m for pref in OLLAMA_PREFS for m in models if m.startswith(pref)), models[0])
-        return {"provider": "Ollama (local, open-source)", "base_url": PROVIDERS["Ollama (local, open-source)"]["base_url"],
-                "model": pick, "api_key": "ollama"}
-    return None
+def asked_changes(question: str, features) -> dict:
+    """Explicit feature values in a question: 'what if A were 40 and C = north' -> {'A': '40', 'C': 'north'}."""
+    feats = {f.casefold(): f for f in features}
+    pairs = re.findall(r"\b(\w+)\s*(?:==|=|:|\bto\b|\bwere\b|\bwas\b|\bis\b|\bat\b)\s*(\"[^\"]*\"|'[^']*'|[-\w.,]+)", question)
+    return {feats[f.casefold()]: v.strip("\"'").rstrip(".,") for f, v in pairs if f.casefold() in feats}
+
+
+def offline_answer(question: str, tools: dict, facts: dict) -> dict:
+    """No LLM: answer what-if and what-would-flip-it questions straight from the tools."""
+    changes = asked_changes(question, facts["row"])
+    if changes:
+        r = tools["what_if"](changes)
+        probs = ", ".join(f"{c} {p:.0%}" for c, p in r["new_probabilities"].items())
+        return {"text": f"With {', '.join(f'`{k} = {v}`' for k, v in r['applied_changes'].items())} the model predicts "
+                        f"**{r['new_prediction']}** ({probs}); as uploaded it was **{facts['predicted_class']}** "
+                        f"({facts['confidence']:.0%}).", "tools": ["what_if"]}
+    if re.search(r"flip|change|different|other class|would it take", question, re.I):
+        cf = tools["find_counterfactual"]()
+        lines = [f"- `{f['feature']}` {f['from']} -> {f['to']} flips it to **{f['new_prediction']}** ({f['new_confidence']:.0%})"
+                 for f in cf["flips"]]
+        return {"text": "Single changes that would flip the prediction:\n" + "\n".join(lines) if lines
+                else "No single-feature change flips this prediction - it is robust.", "tools": ["find_counterfactual"]}
+    return {"text": "The local model isn't running, so right now I can only answer what-if questions "
+                    "(for example `what if A = 40?`) and *what would flip it?*.", "tools": []}

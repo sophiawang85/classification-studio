@@ -2,7 +2,6 @@
 import io
 import tempfile
 from pathlib import Path
-from types import SimpleNamespace as NS
 
 import numpy as np
 import pandas as pd
@@ -60,12 +59,21 @@ with tempfile.TemporaryDirectory() as tmp:
     e = agent.explain(b, X.iloc[[2]])
     assert "**Verdict**" in e["text"] and e["trace"][0]["tool"] == "get_feature_contributions"
 
-    # agent loop with a scripted LLM: one tool call, then a final answer
-    call = NS(id="t1", function=NS(name="get_feature_contributions", arguments="{}"))
-    replies = iter([NS(tool_calls=[call], content=None), NS(tool_calls=None, content="**Verdict** - because of A.")])
-    fake = NS(chat=NS(completions=NS(create=lambda **kw: NS(choices=[NS(message=next(replies))]))))
-    tools, facts = agent.make_tools(b, X.iloc[[2]])
-    text, trace = agent.run_agent(tools, facts, {"model": "fake"}, client=fake)
-    assert text.startswith("**Verdict**") and trace[0]["tool"] == "get_feature_contributions" and "contributions" in trace[0]["result"]
+    # agent loop with a scripted LLM (Ollama /api/chat message shape): one tool call, then a final answer
+    replies = iter([{"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "get_feature_contributions", "arguments": {}}}]},
+                    {"role": "assistant", "content": "**Verdict** - because of A."}])
+    e2 = agent.explain(b, X.iloc[[2]], model="fake", chat=lambda msgs: next(replies))
+    assert e2["text"].startswith("**Verdict**") and "fake" in e2["engine"] and e2["trace"][0]["tool"] == "get_feature_contributions"
+
+    # follow-up chat: scripted LLM answer, then the offline fallback for what-if / what-would-flip-it questions
+    a = agent.ask(b, X.iloc[[2]], e["text"], [], "why?", model="fake", chat=lambda msgs: {"role": "assistant", "content": "Because of A."})
+    assert a["text"] == "Because of A." and a["tools"] == []
+    assert "predicts" in agent.ask(b, X.iloc[[2]], e["text"], [], "what if A were 3?")["text"]
+    assert "flip" in agent.ask(b, X.iloc[[2]], e["text"], [], "what would flip it?")["text"]
+
+    # guardrail: a contribution claim with the wrong direction is rewritten from the Shapley values
+    r0 = e["contrib"]["contributions"][0]
+    wrong = f"{r0['feature']} = {r0['value']} {'lowers' if r0['effect_pts'] > 0 else 'raises'} P({e['contrib']['explaining_class']}) by {abs(r0['effect_pts'])} points"
+    assert agent.fix_claims(wrong, e["contrib"]) == r0["summary"] and agent.fix_claims(r0["summary"], e["contrib"]) == r0["summary"]
 
 print("ok - all smoke checks passed")

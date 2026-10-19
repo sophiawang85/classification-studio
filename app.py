@@ -21,13 +21,15 @@ import pipeline as pl
 from agent import _fmt as fmt
 
 st.set_page_config(page_title="Classification Studio", page_icon="🧭", layout="wide")
-try:  # optional .streamlit/secrets.toml -> env vars; keys never live in code
-    os.environ.update({k: str(v) for k, v in st.secrets.items() if k.endswith("_API_KEY")})
+try:  # optional .streamlit/secrets.toml -> env vars (OLLAMA_HOST / OLLAMA_MODEL / OLLAMA_API_KEY); never in code or UI
+    os.environ.update({k: str(v) for k, v in st.secrets.items() if k.startswith("OLLAMA_")})
 except Exception:
     pass
 
-# Models trained from the UI live in a per-session temp dir, so a visitor can never overwrite the shared model
-# in artifacts/ (that one changes only via `python train.py`).
+# Hosted as a public demo (Streamlit Community Cloud mounts the repo under /mount/src, or PUBLIC_DEMO=1), a model trained
+# from an upload lives in a per-session temp dir, so a visitor can never overwrite the shared one. Run locally, an
+# upload replaces the saved model in artifacts/, exactly like `python train.py`.
+PUBLIC_DEMO = os.environ.get("PUBLIC_DEMO", "1" if Path(__file__).resolve().as_posix().startswith("/mount/src/") else "0") == "1"
 ART = Path(st.session_state.get("model_dir", pl.ART))
 if not (ART / "model.joblib").exists():  # session model vanished (temp cleanup) -> back to the shared one
     ART = pl.ART
@@ -115,8 +117,8 @@ def process(_b, key, name, data):
 
 
 @st.cache_data(ttl=30, show_spinner=False)
-def detect_llm():
-    return agent.auto_llm()
+def agent_status():
+    return agent.ollama_status()
 
 
 def iqr_outliers(s):
@@ -128,19 +130,21 @@ def iqr_outliers(s):
 def trainer(expanded):
     with st.expander("⬆️ Train on a labeled dataset (columns A-G + label H)", expanded=expanded):
         st.caption("Any CSV/Excel with the A-G inputs and the H label. The app infers column types, cleans, splits "
-                   "90/10, tunes and compares 6 model families + an ensemble (~1 min for 6k rows). The new model is used "
-                   "in **your browser session only**; the shared model is unchanged.")
+                   "90/10, tunes and compares 6 model families + an ensemble (~1 min for 6k rows). "
+                   + ("The new model is used in **your browser session only**; the shared demo model is unchanged." if PUBLIC_DEMO
+                      else "The new model **replaces the saved one** in `artifacts/`, like `python train.py`."))
         f = st.file_uploader("Labeled training file", type=FILE_TYPES, key="train_upload")
         if f is not None and st.button(f"Train on {f.name}", type="primary"):
             bar = st.progress(0.0, "Reading file...")
-            out = tempfile.mkdtemp(prefix="session_model_")  # ponytail: never cleaned up; fine for a demo server
+            out = tempfile.mkdtemp(prefix="session_model_") if PUBLIC_DEMO else pl.ART  # ponytail: temp dirs never cleaned up
             try:
                 pl.train(pl.read_table(f.getvalue(), f.name), source=f.name, out_dir=out,
                          progress=lambda frac, msg: bar.progress(min(float(frac), 1.0), msg))
             except Exception as e:
                 st.error(f"Training failed: {e}")
                 return
-            st.session_state.model_dir = out
+            if PUBLIC_DEMO:
+                st.session_state.model_dir = out
             st.rerun()
 
 
@@ -178,30 +182,11 @@ with st.sidebar:
             st.rerun()
     st.divider()
     st.subheader("🤖 Explainer agent")
-    choice = st.selectbox("LLM", ["Auto-detect", *agent.PROVIDERS, "Offline (no LLM)"],
-                          help="Auto-detect: OPENAI_API_KEY / ANTHROPIC_API_KEY env var, else a running Ollama, else offline.")
-    if choice == "Auto-detect":
-        llm = detect_llm()
-    elif choice == "Offline (no LLM)":
-        llm = None
+    model, note = agent_status()
+    if model:
+        st.success(f"Running on Ollama · `{model}`", icon="🟢")
     else:
-        p = agent.PROVIDERS[choice]
-        needs_key = choice in ("OpenAI", "Anthropic (Claude)")
-        base = p["base_url"] if needs_key else st.text_input("Base URL", p["base_url"])
-        default_model = p["model"]
-        if choice.startswith("Ollama"):
-            found = agent.ollama_models()
-            default_model = next((m for pref in agent.OLLAMA_PREFS for m in found if m.startswith(pref)), found[0] if found else p["model"])
-        model = st.text_input("Model", default_model)
-        key = st.text_input("API key", type="password", help="Held in memory for this browser session only; never saved.") if p["env"] else ""
-        key = key or os.environ.get(p["env"] or "", "")
-        llm = {"provider": choice, "base_url": base, "model": model, "api_key": key} if (key or not needs_key) and model and base else None
-    if llm:
-        st.success(f"Using **{llm['provider']}** · `{llm['model']}`", icon="🟢")
-    else:
-        st.info("No LLM configured - the **offline explainer** runs the same tools and fills a template. "
-                "For an LLM-written explanation, pick OpenAI or Anthropic above and paste your own key, or run the app "
-                "locally with [Ollama](https://ollama.com) (`ollama pull qwen2.5:7b`) for a free open-source model.", icon="⚪")
+        st.info(f"{note} - explanations use the offline template and the chat answers what-if questions only.", icon="⚪")
 
 st.title("🧭 Classification Studio")
 st.caption("Labeled data in -> exploration -> cleaning -> validated model -> live predictions with an on-demand AI explainer.")
@@ -671,7 +656,7 @@ def waterfall(ctb):
 
 
 @st.fragment
-def predict_tab(llm):
+def predict_tab(model):
     st.markdown(f"Upload rows with columns **{', '.join(b['all_features'])}**. The saved pipeline cleans, encodes and scores them "
                 f"immediately. Columns are matched case-insensitively, extra columns are ignored, and if **{LABEL}** is present "
                 "the predictions are scored against it.")
@@ -745,14 +730,15 @@ def predict_tab(llm):
                 st.markdown("#### 💬 Prediction explainer")
                 st.markdown("Tick **Explain** on a row. The agent then:\n1. computes exact **Shapley contributions** of A-G for that row,\n"
                             "2. compares the row's values with the **training data**,\n3. searches **what-if** changes that would flip the outcome,\n"
-                            "4. writes a short, plain-language explanation.\n\nNothing is pre-computed: it runs only when asked.")
+                            "4. writes a short, plain-language explanation - then you can **ask it follow-up questions**.\n\n"
+                            "Nothing is pre-computed: it runs only when asked.")
         else:
             r = pick[1]
             cache = st.session_state.setdefault("explanations", {})
-            ck = (src, r, f"{llm['provider']}|{llm['model']}" if llm else "offline")
+            ck = (src, r, model or "offline")
             if ck not in cache:
                 with st.spinner(f"Agent investigating row {r}..."):
-                    cache[ck] = agent.explain(b, X.loc[[r]], llm)
+                    cache[ck] = agent.explain(b, X.loc[[r]], model)
             e = cache[ck]
             with st.container(border=True):
                 st.markdown(f"#### Row {r} -> **{out.at[r, 'Prediction']}** · {out.at[r, 'Confidence']:.0%} confidence")
@@ -767,7 +753,23 @@ def predict_tab(llm):
                         st.json(step["result"], expanded=False)
                 if st.button("↻ Re-run explanation", key=f"rerun_{src}_{r}"):
                     cache.pop(ck, None)
-                    st.rerun(scope="fragment")
+                    st.rerun()
+
+                st.markdown("**💬 Ask the agent about this row**")
+                hist = st.session_state.setdefault("chats", {}).setdefault((src, r), [])
+                box = st.container()  # messages render here, above the input, in the same run (no rerun needed)
+                q = st.chat_input("e.g. What if A were 30? What would flip it?", key=f"ask_{src}_{r}")
+                if q:
+                    with box, st.spinner("Agent is working on it..."):
+                        ans = agent.ask(b, X.loc[[r]], e["text"], [{"role": m["role"], "content": m["content"]} for m in hist], q, model)
+                    hist += [{"role": "user", "content": q},
+                             {"role": "assistant", "content": ans["text"], "tools": ans["tools"], "note": ans.get("note", "")}]
+                with box:
+                    for m in hist:
+                        with st.chat_message(m["role"]):
+                            st.markdown(m["content"])
+                            if m["role"] == "assistant":
+                                st.caption("tools used: " + (", ".join(m["tools"]) or "none") + (f" · {m['note']}" if m.get("note") else ""))
 
     g1, g2, g3 = st.columns([2, 2, 1])
     with g1:
@@ -789,4 +791,4 @@ def predict_tab(llm):
 
 
 with tab2:
-    predict_tab(llm)
+    predict_tab(model)

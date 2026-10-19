@@ -11,7 +11,8 @@ prediction.
   (as uploaded vs. after cleaning, with every fixed cell highlighted), EDA, the cleaning log, before/after views of every transformation, the
   split strategy, a comparison of 6 tuned model families plus an ensemble, and test-set results.
 * **Tab 2 – Predict & explain:** upload the hold-out set (or any A–G file). The saved pipeline cleans, encodes and
-  scores it right away. Tick **💬 Explain** on any row to ask the agent why the model predicted it.
+  scores it right away. Tick **💬 Explain** on any row to ask the agent why the model predicted it, then ask it
+  follow-up questions ("what if A were 30?", "what would flip it?").
 
 ## Run it
 
@@ -35,24 +36,31 @@ To change the shared model, run:
 python train.py data/<your_file>.xlsx
 ```
 
-You can also upload a labeled CSV/Excel file in **Tab 1 → "Train on a labeled dataset"**. That model is used only in
-your own browser session, so visitors to a public link can't replace the shared model.
+You can also upload a labeled CSV/Excel file in **Tab 1 → "Train on a labeled dataset"**. Run locally, that replaces the
+saved model too. On the hosted demo (or with `PUBLIC_DEMO=1`), the model stays in the visitor's own browser session, so
+visitors can't replace the shared one.
 
 Training writes `artifacts/model.joblib` and the 10% hold-out set, `artifacts/holdout_test.csv` (columns A–G). That
 hold-out file is what you upload in Tab 2. A copy with labels, `holdout_test_labeled.csv`, makes Tab 2 also report
 accuracy. `data/synthetic_demo.csv` is a deliberately messy synthetic dataset with the same shape, used to show the
 pipeline works on any data.
 
-### The AI explainer: no key needed
+### The AI agent: a local open-source model via Ollama
 
-| Option | Setup | Key? |
-|---|---|---|
-| Offline explainer (default fallback) | nothing | no |
-| **Open-source LLM, local** | install [Ollama](https://ollama.com), then `ollama pull qwen2.5:7b` (auto-detected) | no |
-| OpenAI / Anthropic / any OpenAI-compatible API | set `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`, or paste a key in the sidebar | yourself |
+The agent runs on [Ollama](https://ollama.com) with the open-source `qwen2.5:7b` model. No API key is needed, and data
+never leaves the machine. Install Ollama, then:
 
-Keys are never stored in code or on disk. A key typed into the sidebar lives only in that browser session. You can
-also use `.streamlit/secrets.toml`; don't ship that file.
+```bash
+ollama pull qwen2.5:7b      # once, about 4.7 GB
+```
+
+The app connects to Ollama by itself; there is nothing to configure in the UI. If Ollama isn't running, Explain uses an
+offline template built on the same analysis, and the chat still answers what-if and "what would flip it?" questions.
+
+Backend settings, all optional, as environment variables or in `.streamlit/secrets.toml`:
+* `OLLAMA_HOST`: default `http://localhost:11434`;
+* `OLLAMA_MODEL`: default `qwen2.5:7b`, otherwise the best installed chat model;
+* `OLLAMA_API_KEY`: only for a remote Ollama server that requires one.
 
 ### Verify
 
@@ -66,7 +74,7 @@ python test_smoke.py     # trains a small model, then tries messy uploads, Shapl
 
 ```bash
 brew install cloudflared                                   # once
-streamlit run app.py --server.port 8502 --server.address 127.0.0.1 &
+PUBLIC_DEMO=1 streamlit run app.py --server.port 8502 --server.address 127.0.0.1 &
 cloudflared tunnel --url http://127.0.0.1:8502             # prints https://<random>.trycloudflare.com
 ```
 
@@ -131,6 +139,8 @@ exactly the same transformations.
   coalitions, so contributions add up exactly from the baseline to the prediction); training-data context
   (percentiles, per-class medians, category mixes); a **counterfactual search** for the smallest single-feature change
   that flips the outcome; what-if re-scoring; and a model card.
-* An LLM chooses which tools to call and writes the explanation, quoting only numbers the tools returned. It works
-  with any OpenAI-compatible endpoint, so a local open-source model, OpenAI and Anthropic all go through the same code.
+* A local open-source LLM (Ollama, `qwen2.5:7b`) chooses which tools to call and writes the explanation, quoting only
+  numbers the tools returned.
+* **Ask the agent:** under each explanation, a chat box lets you ask follow-up questions about that row. The agent
+  answers by calling the same tools, for example re-scoring "what if A were 30?".
 * With no LLM, or if a call fails, the same tools fill a template, so **Explain always works**.
