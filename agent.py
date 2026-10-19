@@ -231,6 +231,8 @@ def _ollama(path, payload=None, timeout=180):
 
 def ollama_status():
     """(model, note): the model the agent will use, or None and why not."""
+    if os.environ.get("OLLAMA_API_KEY") and os.environ.get("OLLAMA_MODEL"):
+        return os.environ["OLLAMA_MODEL"], ""  # hosted Ollama: trust the configured model; a failed call falls back offline
     try:
         names = [m["name"] for m in _ollama("/api/tags", timeout=3).get("models", []) if "embed" not in m["name"]]
     except Exception:

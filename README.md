@@ -57,6 +57,16 @@ ollama pull qwen2.5:7b      # once, about 4.7 GB
 The app connects to Ollama by itself; there is nothing to configure in the UI. If Ollama isn't running, Explain uses an
 offline template built on the same analysis, and the chat still answers what-if and "what would flip it?" questions.
 
+**Hosted website, always on:** Streamlit Cloud can't run Ollama itself, so point the app at Ollama's hosted API. In
+the app's **Settings → Secrets** on share.streamlit.io, add the lines below. The key stays in Streamlit's secret store,
+never in the repo.
+
+```toml
+OLLAMA_HOST = "https://ollama.com"
+OLLAMA_API_KEY = "<your key from ollama.com/settings/keys>"
+OLLAMA_MODEL = "gpt-oss:120b"   # or any tool-capable model from ollama.com's cloud list
+```
+
 Backend settings, all optional, as environment variables or in `.streamlit/secrets.toml`:
 * `OLLAMA_HOST`: default `http://localhost:11434`;
 * `OLLAMA_MODEL`: default `qwen2.5:7b`, otherwise the best installed chat model;
